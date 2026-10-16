@@ -1,0 +1,39 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.*.pyc
+**/*.pyc
+.pytest_cache/
+**/.pytest_cache/
+*.pyo
+*$py.class
+
+# Local databases
+*.db
+*.db-journal
+
+# Virtual environments
+.venv/
+venv/
+
+# Node
+node_modules/
+.next/
+out/
+
+# OS
+.DS_Store
+
+# Load testing artifacts
+*.csv
+load_*
+
+.vscode/
+.neon
+Cafe-Server/
