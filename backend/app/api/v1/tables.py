@@ -9,6 +9,7 @@ from app.api.deps import get_db, require_permission, verify_dining_session_acces
 STAFF_ONLY = [Depends(require_permission("pos:access"))]
 from app.models.table import Table, TableQR, DiningSession
 from app.schemas.table import (
+    TableCreate,
     TableResponse,
     TableQRResponse,
     QRValidateRequest,
@@ -17,11 +18,50 @@ from app.schemas.table import (
     QRWalkInResponse,
     DiningSessionResponse,
     SessionBillResponse,
+    GeneralizedQRResponse,
+    GeneralizedQRListResponse,
+    ToggleQRStatusRequest,
+    ClaimReservationRequest,
+    ClaimReservationResponse,
 )
 from app.services.table_service import TableService
 
 router = APIRouter(prefix="/tables", tags=["Tables & QR Sessions"])
 sessions_router = APIRouter(prefix="/sessions", tags=["Dining Sessions"])
+
+
+@router.get("/qr/generalized", response_model=GeneralizedQRListResponse, dependencies=STAFF_ONLY)
+async def get_generalized_qrs(db: AsyncSession = Depends(get_db)):
+    return await TableService.get_generalized_qrs(db)
+
+
+@router.post("/qr/generalized/generate", response_model=GeneralizedQRResponse, dependencies=STAFF_ONLY)
+async def generate_fresh_generalized_qr(db: AsyncSession = Depends(get_db)):
+    return await TableService.generate_fresh_generalized_qr(db)
+
+
+@router.post("/qr/generalized/toggle-status", response_model=GeneralizedQRResponse, dependencies=STAFF_ONLY)
+async def toggle_qr_status(body: ToggleQRStatusRequest, db: AsyncSession = Depends(get_db)):
+    return await TableService.toggle_qr_status(db, qr_token=body.qr_token, qr_id=body.id, is_active=body.is_active)
+
+
+@router.delete("/qr/generalized", dependencies=STAFF_ONLY)
+async def delete_generalized_qr(
+    qr_token: str = None,
+    id: int = None,
+    db: AsyncSession = Depends(get_db)
+):
+    return await TableService.delete_generalized_qr(db, qr_token=qr_token, qr_id=id)
+
+
+@router.post("/qr/claim-reservation", response_model=ClaimReservationResponse)
+async def claim_reservation(body: ClaimReservationRequest, db: AsyncSession = Depends(get_db)):
+    return await TableService.claim_reservation(
+        db=db,
+        qr_token=body.qr_token,
+        session_token=body.session_token,
+        reservation_code=body.reservation_code,
+    )
 
 
 @router.get("", response_model=List[TableResponse], dependencies=STAFF_ONLY)
@@ -30,6 +70,62 @@ async def list_tables(db: AsyncSession = Depends(get_db)):
     query = select(Table).options(selectinload(Table.qr_code)).order_by(Table.id)
     result = await db.execute(query)
     return result.scalars().all()
+
+
+@router.post("", response_model=TableResponse, status_code=201, dependencies=STAFF_ONLY)
+async def add_table(body: TableCreate, db: AsyncSession = Depends(get_db)):
+    import secrets
+    from sqlalchemy.orm import selectinload
+    from app.models.branch import Branch
+
+    branch = (await db.execute(select(Branch).order_by(Branch.id))).scalars().first()
+    if not branch:
+        raise HTTPException(status_code=400, detail="No branch is set up yet.")
+    tables = (await db.execute(select(Table))).scalars().all()
+    taken = [t.floor_table_num for t in tables if t.floor_number == body.floor_number]
+    table = Table(
+        # The original 13 tables were created with fixed ids, so the id counter lags; pick the next id ourselves
+        id=max((t.id for t in tables), default=0) + 1,
+        branch_id=branch.id,
+        table_number=f"Table {max(taken, default=0) + 1}",
+        capacity=body.capacity,
+        status="Available",
+        floor=body.floor_number,
+    )
+    db.add(table)
+    await db.flush()
+    db.add(TableQR(table_id=table.id, qr_token=f"qr_sec_{secrets.token_hex(16)}", is_active=True))
+    await db.commit()
+    return (await db.execute(select(Table).options(selectinload(Table.qr_code)).where(Table.id == table.id))).scalar_one()
+
+
+@router.delete("/{id}", dependencies=STAFF_ONLY)
+async def remove_table(id: int, db: AsyncSession = Depends(get_db)):
+    """Remove a table added from admin by mistake. Only allowed if it was never used, so no bill history is lost."""
+    from sqlalchemy import func
+    from app.models.kot import KOT
+    from app.models.reservation import Reservation
+
+    table = await db.get(Table, id)
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found.")
+    if not table.floor:
+        raise HTTPException(status_code=400, detail="The original tables can't be removed.")
+    used = sum(
+        [
+            (await db.execute(select(func.count(DiningSession.id)).where(DiningSession.table_id == id))).scalar() or 0,
+            (await db.execute(select(func.count(KOT.id)).where(KOT.table_id == id))).scalar() or 0,
+            (await db.execute(select(func.count(Reservation.id)).where(Reservation.table_id == id))).scalar() or 0,
+        ]
+    )
+    if used:
+        raise HTTPException(status_code=409, detail=f"{table.table_number} has orders or bookings, so it can't be removed.")
+    qr = (await db.execute(select(TableQR).where(TableQR.table_id == id))).scalar_one_or_none()
+    if qr:
+        await db.delete(qr)
+    await db.delete(table)
+    await db.commit()
+    return {"removed": id}
 
 
 @router.get("/{id}/qr", response_model=TableQRResponse, dependencies=STAFF_ONLY)

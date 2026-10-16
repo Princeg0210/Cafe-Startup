@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.schemas.reservation import sanitize_customer_name, sanitize_customer_phone
 
 
@@ -16,6 +16,13 @@ class TableResponse(BaseModel):
     floor_name: Optional[str] = "Ground floor"
     floor_table_num: Optional[int] = 1
     qr_token: Optional[str] = None
+    floor: Optional[int] = None  # set only for tables added from admin (those can be removed if unused)
+
+
+class TableCreate(BaseModel):
+    """Add a table from admin: it gets the next number on its floor and its own QR code."""
+    floor_number: int = Field(..., ge=1, le=5)
+    capacity: int = Field(4, ge=1, le=20)
 
 
 class TableQRResponse(BaseModel):
@@ -86,6 +93,44 @@ class QRValidateResponse(BaseModel):
     session_status: str
     is_reserved: bool = False
     reservation: Optional[ReservationNotice] = None
+    is_generalized: bool = False
+
+
+class GeneralizedQRResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    qr_token: str
+    is_active: bool
+    created_at: datetime
+    notes: Optional[str] = None
+
+
+class GeneralizedQRListResponse(BaseModel):
+    active_qr: Optional[GeneralizedQRResponse] = None
+    all_qrs: List[GeneralizedQRResponse] = []
+
+
+class ToggleQRStatusRequest(BaseModel):
+    qr_token: Optional[str] = None
+    id: Optional[int] = None
+    is_active: bool
+
+
+class ClaimReservationRequest(BaseModel):
+    qr_token: str
+    session_token: str
+    reservation_code: str
+
+
+class ClaimReservationResponse(BaseModel):
+    success: bool
+    reservation_id: int
+    customer_name: str
+    table_id: Optional[int] = None
+    table_number: str
+    status: str
+    guest_count: int
 
 
 class DiningSessionResponse(BaseModel):

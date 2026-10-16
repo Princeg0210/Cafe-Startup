@@ -1,7 +1,8 @@
 from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from app.schemas.order import OrderItemCreate
 
 
 class KOTItemResponse(BaseModel):
@@ -68,6 +69,7 @@ class POSSummaryResponse(BaseModel):
 
 
 class SessionItemDetail(BaseModel):
+    menu_item_id: Optional[int] = None
     name: str
     quantity: int
     unit_price: Decimal
@@ -132,3 +134,8 @@ class MergeTablesRequest(BaseModel):
     source_table_id: int
     target_table_id: int
 
+
+class POSOrderCreate(BaseModel):
+    """An order taken by staff at the POS for a table (payment is taken later, at billing)."""
+    items: List[OrderItemCreate] = Field(..., min_length=1)
+    allergy_info: Optional[str] = Field(None, max_length=500)

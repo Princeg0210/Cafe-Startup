@@ -2,6 +2,7 @@ import datetime
 from app.utils.helpers import utc_now
 import asyncio
 import secrets
+from types import SimpleNamespace
 from decimal import Decimal
 from typing import Dict, List
 from sqlalchemy import select, func
@@ -10,26 +11,66 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status
 from app.models.table import Table, DiningSession
 from app.services.table_service import TableService
-from app.models.menu import MenuItem
+from app.models.menu import MenuCategory, MenuItem
 from app.models.order import Order, OrderItem, OrderStatusHistory
 from app.models.kitchen import KitchenOrder, PrintJob
 from app.models.kot import KOT
 from app.schemas.order import OrderCreate
 from app.services.capacity_service import CapacityService
 from app.services.inventory_service import InventoryService
+from app.core.config import settings
 
 
 class OrderService:
     @staticmethod
-    async def place_order(db: AsyncSession, data: OrderCreate) -> Order:
+    async def _is_pizza(db: AsyncSession, item_data) -> bool:
+        """Pizzas are the items in a menu category whose name contains "pizza"."""
+        menu_item = None
+        if item_data.menu_item_id:
+            menu_item = await db.get(MenuItem, item_data.menu_item_id)
+        elif item_data.name and item_data.name.strip():
+            menu_item = (
+                await db.execute(select(MenuItem).where(func.lower(MenuItem.name) == item_data.name.strip().lower()))
+            ).scalars().first()
+        if not menu_item:
+            return False
+        category = await db.get(MenuCategory, menu_item.category_id)
+        return bool(category and "pizza" in (category.name or "").lower())
+
+    @staticmethod
+    async def place_order(db: AsyncSession, data: OrderCreate, staff_table_id: int | None = None) -> Order:
+        """Pizzas go to the kitchen on their own KOT, everything else on a second KOT.
+
+        An order with both is split into two orders on the same table bill (one KOT each);
+        the pizza order is returned.
+        """
+        flags = [await OrderService._is_pizza(db, it) for it in data.items]
+        pizzas = [it for it, p in zip(data.items, flags) if p]
+        others = [it for it, p in zip(data.items, flags) if not p]
+        if not pizzas or not others:
+            return await OrderService._place_single_order(db, data, staff_table_id)
+        pizza_order = await OrderService._place_single_order(db, data.model_copy(update={"items": pizzas}), staff_table_id)
+        await OrderService._place_single_order(db, data.model_copy(update={"items": others}), staff_table_id)
+        return pizza_order
+
+    @staticmethod
+    async def _place_single_order(db: AsyncSession, data: OrderCreate, staff_table_id: int | None = None) -> Order:
+        """Guest orders come in through the table's QR code; POS staff pass staff_table_id instead."""
         try:
-            val = await TableService.validate_qr_token(db, data.qr_token)
+            if staff_table_id is not None:
+                staff_table = await db.get(Table, staff_table_id)
+                if not staff_table:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found.")
+                val = SimpleNamespace(table_id=staff_table.id, is_generalized=False)
+            else:
+                val = await TableService.validate_qr_token(db, data.qr_token)
 
             if data.session_token:
                 sess_query = select(DiningSession).where(
                     DiningSession.session_token == data.session_token,
-                    DiningSession.table_id == val.table_id,
                 )
+                if not getattr(val, "is_generalized", False):
+                    sess_query = sess_query.where(DiningSession.table_id == val.table_id)
                 sess_res = await db.execute(sess_query)
                 dining_session = sess_res.scalar_one_or_none()
                 if not dining_session:
@@ -172,7 +213,8 @@ class OrderService:
                     production_date=production_date,
                     reservation_id=order_reservation_id,
                 )
-                await InventoryService.deduct_bom_stock(db, menu_item.id, item_data.quantity, order_number)
+                if settings.INVENTORY_AUTO_DEDUCT:  # off for now (see config)
+                    await InventoryService.deduct_bom_stock(db, menu_item.id, item_data.quantity, order_number)
 
                 unit_price = Decimal(str(menu_item.price))
                 subtotal = unit_price * Decimal(str(item_data.quantity))

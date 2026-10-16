@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, use } from "react";
+import Link from "next/link";
 import BrandTitle from "@/components/BrandTitle";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -27,7 +28,8 @@ import {
   ShieldCheck,
   HeartHandshake,
 } from "lucide-react";
-import { ITEM_MEDIA_MAP, menuData, MENU_ITEM_ID_MAP } from "@/data/menu";
+import { ITEM_MEDIA_MAP, menuData, MENU_ITEM_ID_MAP, fetchLiveMenu as loadLiveMenu } from "@/data/menu";
+import { toast } from "@/components/ui/toast";
 import { getFloorName } from "@/data/floors";
 import { ALL_COUNTRY_CODES } from "@/lib/countryCodes";
 
@@ -72,6 +74,9 @@ interface BillData {
   grand_total: number;
   allergy_info?: string | null;
 }
+
+// Guests go straight to the menu while this is in the future (end of 17 Oct 2026, India time)
+const CHECKIN_POPUP_PAUSED_UNTIL = new Date("2026-10-17T23:59:59+05:30").getTime();
 
 export default function TableQRPage({ params }: { params: Promise<{ token: string }> }) {
   const resolvedParams = use(params);
@@ -131,45 +136,10 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
     return "";
   };
 
-  // Sync live prices and stock availability from backend API
+  // The menu as set up in admin (new dishes included), with live prices and stock
   const fetchLiveMenu = React.useCallback(async () => {
-    try {
-      const apiBase = getApiBase();
-      const res = await fetch(`${apiBase}/api/v1/menu/items`);
-      if (!res.ok) return;
-      const dbItems: Array<{
-        id: number;
-        category_id: number;
-        name: string;
-        description?: string;
-        price: string | number;
-        is_available: boolean;
-        is_sold_out?: boolean;
-        image_url?: string | null;
-      }> = await res.json();
-
-      const dbMapById = new Map(dbItems.map((item) => [item.id, item]));
-
-      setLiveMenuData((prev) => {
-        return prev.map((category) => {
-          return {
-            ...category,
-            items: category.items.map((item) => {
-              const matched = dbMapById.get(MENU_ITEM_ID_MAP[String(item.id)]);
-              if (matched) {
-                return {
-                  ...item,
-                  price: Number(matched.price),
-                  is_available: matched.is_available && !matched.is_sold_out,
-                  image_url: matched.image_url || item.image_url,
-                };
-              }
-              return item;
-            }),
-          };
-        });
-      });
-    } catch {}
+    const live = await loadLiveMenu(getApiBase());
+    if (live) setLiveMenuData(live);
   }, []);
 
   // Live WebSocket listener for instant hand-to-hand menu status updates
@@ -226,13 +196,18 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
         });
         if (res.ok) {
           const data = await res.json();
-          const cleanNum = data.table_number.replace(/[^0-9]/g, "").padStart(2, "0") || data.table_number;
-          setTableNumber(`TABLE ${cleanNum}`);
+          if (data.is_generalized) {
+            setTableNumber("Table allotted by server");
+          } else {
+            const cleanNum = data.table_number.replace(/[^0-9]/g, "").padStart(2, "0") || data.table_number;
+            setTableNumber(`TABLE ${cleanNum}`);
+          }
           setSessionId(data.session_id);
           setSessionToken(data.session_token);
           setValidatedQrToken(rawToken);
           setIsValidQr(true);
-          setShowReservationIdPrompt(true);
+          // Welcome pop-up (Reservation ID / Walk-in) is paused until the date below, then returns by itself
+          if (Date.now() > CHECKIN_POPUP_PAUSED_UNTIL) setShowReservationIdPrompt(true);
           if (data.is_reserved && data.reservation) {
             setReservationNotice(data.reservation);
             if (data.reservation.quick_dine_minutes) {
@@ -243,7 +218,13 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
           }
         } else {
           setIsValidQr(false);
-          setQrErrorMessage("This table QR code is invalid, expired, or has rotated. Direct URL manipulation is prohibited for dining privacy.");
+          const errData = await res.json().catch(() => null);
+          const detail = typeof errData?.detail === "string" ? errData.detail : "";
+          if (detail.toLowerCase().includes("deactivated") || detail.toLowerCase().includes("inactive")) {
+            setQrErrorMessage("This QR code is currently inactive or deactivated. Please ask our staff for an active QR code.");
+          } else {
+            setQrErrorMessage(detail || "This table QR code is invalid, expired, or has rotated. Direct URL manipulation is prohibited for dining privacy.");
+          }
           setSessionId(null);
           setSessionToken(null);
         }
@@ -320,42 +301,86 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
         setReservationNotice((prev) =>
           prev ? { ...prev, status: "SEATED", allow_self_checkin: false } : null
         );
+        toast.success("Check-in successful! Welcome to Jaadoo Pizza Project.");
       } else {
-        alert("Check-in could not be completed. Please inform your server or floor manager.");
+        toast.error("Check-in could not be completed. Please inform your server or floor manager.");
       }
     } catch {
-      alert("Network error during check-in. Please try again.");
+      toast.error("Network error during check-in. Please try again.");
     } finally {
       setIsCheckingIn(false);
     }
   };
 
   // ponytail: seamless match by numeric ID or 4-letter + 4-phone booking code
-  const continueFromReservationPrompt = () => {
+  const continueFromReservationPrompt = async () => {
     const entered = reservationIdInput.trim();
     if (!entered) {
       setPromptError("Please enter your reservation ID to continue.");
       return;
     }
 
-    if (reservationNotice) {
-      const numericPart = entered.replace(/\D/g, "");
-      const enteredNum = numericPart ? Number(numericPart) : NaN;
-      const cleanEntered = entered.toUpperCase().replace(/\s+/g, "");
-      const expectedLetters = (reservationNotice.customer_name || "").replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 4);
+    try {
+      const apiBase = getApiBase();
+      const res = await fetch(`${apiBase}/api/v1/tables/qr/claim-reservation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          qr_token: validatedQrToken || rawToken,
+          session_token: sessionToken || "",
+          reservation_code: entered,
+        }),
+      });
 
-      const isIdMatch = !isNaN(enteredNum) && enteredNum === reservationNotice.reservation_id;
-      const isCodeMatch = cleanEntered.startsWith(expectedLetters) && cleanEntered.length >= 4;
-
-      if (!isIdMatch && !isCodeMatch) {
-        setPromptError("That reservation ID does not match this table.");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.table_number) {
+          setTableNumber(data.table_number);
+        }
+        setPromptError(null);
+        setHasTableAccess(true);
+        setShowReservationIdPrompt(false);
         return;
       }
-    }
 
-    setPromptError(null);
-    setHasTableAccess(true);
-    setShowReservationIdPrompt(false);
+      // If backend claim returned an error, verify against local notice as fallback
+      if (reservationNotice) {
+        const numericPart = entered.replace(/\D/g, "");
+        const enteredNum = numericPart ? Number(numericPart) : NaN;
+        const cleanEntered = entered.toUpperCase().replace(/\s+/g, "");
+        const expectedLetters = (reservationNotice.customer_name || "").replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 4);
+
+        const isIdMatch = !isNaN(enteredNum) && enteredNum === reservationNotice.reservation_id;
+        const isCodeMatch = cleanEntered.startsWith(expectedLetters) && cleanEntered.length >= 4;
+
+        if (isIdMatch || isCodeMatch) {
+          setPromptError(null);
+          setHasTableAccess(true);
+          setShowReservationIdPrompt(false);
+          return;
+        }
+      }
+
+      const errData = await res.json().catch(() => null);
+      setPromptError(errData?.detail || "That reservation ID was not found or is already seated.");
+    } catch {
+      // Offline / fallback verification
+      if (reservationNotice) {
+        const numericPart = entered.replace(/\D/g, "");
+        const enteredNum = numericPart ? Number(numericPart) : NaN;
+        const cleanEntered = entered.toUpperCase().replace(/\s+/g, "");
+        const expectedLetters = (reservationNotice.customer_name || "").replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 4);
+        const isIdMatch = !isNaN(enteredNum) && enteredNum === reservationNotice.reservation_id;
+        const isCodeMatch = cleanEntered.startsWith(expectedLetters) && cleanEntered.length >= 4;
+        if (isIdMatch || isCodeMatch) {
+          setPromptError(null);
+          setHasTableAccess(true);
+          setShowReservationIdPrompt(false);
+          return;
+        }
+      }
+      setPromptError("Network error. Please try again.");
+    }
   };
 
   // ponytail: simple walk-in registration auto-creates reservation on backend with domestic & intl country codes
@@ -545,12 +570,13 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
         setCart({});
         setAllergyInfo("");
         setShowCartDrawer(false);
+        toast.success("Order dispatched to kitchen! Tracking on table.");
       } else {
         const errData = await res.json().catch(() => ({}));
-        alert(`Order could not be placed: ${typeof errData.detail === "string" ? errData.detail : "Please check the quantities and try again."}`);
+        toast.error(`Order could not be placed: ${typeof errData.detail === "string" ? errData.detail : "Please check the quantities and try again."}`);
       }
     } catch {
-      alert("Network error. Please make sure the café server is reachable.");
+      toast.error("Network error. Please make sure the café server is reachable.");
     }
   };
 
@@ -575,7 +601,9 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
             <UtensilsCrossed className="w-8 h-8" />
           </div>
           <h2 className="font-condensed text-3xl font-extrabold uppercase tracking-wide text-[#261C18]">
-            Invalid Table QR
+            {qrErrorMessage?.toLowerCase().includes("deactivated") || qrErrorMessage?.toLowerCase().includes("inactive")
+              ? "QR Code Deactivated"
+              : "Invalid Table QR"}
           </h2>
           <p className="text-sm text-gray-600 font-sans leading-relaxed">
             {qrErrorMessage || "This QR code is invalid, expired, or has rotated. Please scan the official QR code placed on your dining table."}
@@ -606,35 +634,85 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
   return (
     <div className="min-h-screen bg-[#F7EBD5] text-[#17251A] font-sans selection:bg-[#9E3E26] selection:text-white">
       {/* Direct Focused Header: Table Number & View Bill */}
-      <header className="sticky top-0 z-40 border-b border-[#D7C4A3] bg-[#FFF9EE]/95 px-4 py-2.5 backdrop-blur-md sm:px-6">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3.5">
-            <div className="w-18 h-11 sm:w-22 sm:h-13 rounded-xl overflow-hidden bg-white border-2 border-[#9E3E26]/40 shadow-xs shrink-0">
-              <img
-                src="/jaadoo_logo.jpg"
-                alt="Jaadoo Logo"
-                className="w-full h-full object-cover"
-              />
-            </div>
-            <div>
-              <BrandTitle className="font-serif font-extrabold tracking-wide text-[#5F3F6D] text-base leading-none mt-2" />
-              <span className="text-[10px] font-mono font-bold text-[#4A5842] flex items-center gap-1.5 mt-0.5">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                {tableNumber}
-              </span>
-            </div>
+      <header className="sticky top-0 z-40 border-b border-[#D7C4A3] bg-[#FFF9EE]/95 backdrop-blur-md">
+        {/* Mobile View (< sm): Clean 2-Tier Layout to completely prevent overlapping */}
+        <div className="sm:hidden px-3 py-2 flex flex-col gap-1.5">
+          {/* Tier 1: Brand Logo & Jaadoo Pizza Project centered */}
+          <div className="flex items-center justify-center">
+            <Link href="/" className="flex items-center gap-2 group shrink-0">
+              <div className="w-10 h-7 rounded-lg overflow-hidden bg-white border border-[#9E3E26]/40 shadow-xs shrink-0">
+                <img
+                  src="/jaadoo_logo.jpg"
+                  alt="Jaadoo Logo"
+                  className="w-full h-full object-cover"
+                />
+              </div>
+              <BrandTitle className="font-poppins font-bold tracking-wide text-[#5F3F6D] text-sm leading-tight" />
+            </Link>
           </div>
 
-          <button
-            onClick={fetchBill}
-            className="ml-auto flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-[#261C18] hover:bg-[#B85B43] text-[#FBF9F5] text-xs font-semibold uppercase tracking-wider transition-all shadow-xs"
-          >
-            <Receipt className="w-3.5 h-3.5 text-[#B85B43]" />
-            <span>
-              VIEW BILL
-              {billData && billData.grand_total > 0 ? ` (₹${Math.round(billData.grand_total)})` : ""}
+          {/* Tier 2: Table Badge on Left, View Bill on Right */}
+          <div className="flex items-center justify-between pt-1 border-t border-[#D7C4A3]/40">
+            <span className="text-[10px] font-mono font-bold text-[#1B3618] bg-[#1B3618]/10 border border-[#1B3618]/20 px-2 py-0.5 rounded-md flex items-center gap-1 shrink-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              {tableNumber}
             </span>
-          </button>
+
+            <button
+              onClick={fetchBill}
+              className="flex items-center gap-1 px-3 py-1 rounded-full bg-[#261C18] active:bg-[#B85B43] text-[#FBF9F5] text-[10px] font-bold uppercase tracking-wider transition-all shadow-xs shrink-0 cursor-pointer"
+            >
+              <Receipt className="w-3 h-3 text-[#B85B43]" />
+              <span>
+                VIEW BILL
+                {billData && billData.grand_total > 0 ? ` (₹${Math.round(billData.grand_total)})` : ""}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        {/* Desktop / Tablet View (>= sm): 3-Column Centered Layout */}
+        <div className="hidden sm:grid mx-auto max-w-6xl grid-cols-[1fr_auto_1fr] items-center gap-3 px-4 py-2.5 sm:px-6">
+          {/* Left: Table Indicator */}
+          <div className="flex items-center justify-start min-w-0">
+            <span className="text-xs font-mono font-bold text-[#1B3618] bg-[#1B3618]/10 border border-[#1B3618]/20 px-2.5 py-1 rounded-md flex items-center gap-1.5 shrink-0">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              {tableNumber}
+            </span>
+          </div>
+
+          {/* Center: Editorial Brand Logo & Jaadoo Pizza Project */}
+          <div className="flex items-center justify-center min-w-0">
+            <Link href="/" className="flex items-center gap-2.5 sm:gap-3 group shrink-0">
+              <div className="w-14 h-9 sm:w-18 sm:h-11 rounded-xl overflow-hidden bg-white border-2 border-[#9E3E26]/40 shadow-xs shrink-0 group-hover:border-[#9E3E26] transition-all">
+                <img
+                  src="/jaadoo_logo.jpg"
+                  alt="Jaadoo Logo"
+                  className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                />
+              </div>
+              <div className="flex flex-col justify-center min-w-0 text-center sm:text-left">
+                <BrandTitle className="font-poppins font-bold tracking-wide text-[#5F3F6D] text-sm sm:text-base leading-tight truncate" />
+                <span className="text-[9px] font-sans tracking-wide text-[#B6623B] font-bold leading-none mt-0.5 hidden sm:inline">
+                  Con o senza avanti!
+                </span>
+              </div>
+            </Link>
+          </div>
+
+          {/* Right: Bill Action */}
+          <div className="flex items-center justify-end">
+            <button
+              onClick={fetchBill}
+              className="flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-[#261C18] hover:bg-[#B85B43] text-[#FBF9F5] text-xs font-semibold uppercase tracking-wider transition-all shadow-xs shrink-0 cursor-pointer"
+            >
+              <Receipt className="w-3.5 h-3.5 text-[#B85B43]" />
+              <span>
+                VIEW BILL
+                {billData && billData.grand_total > 0 ? ` (₹${Math.round(billData.grand_total)})` : ""}
+              </span>
+            </button>
+          </div>
         </div>
       </header>
 
@@ -1023,7 +1101,7 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
         </AnimatePresence>
 
         {/* Sticky Category Navigation Filter */}
-        <nav aria-label="Menu categories" className="sticky top-16 z-30 -mx-4 mb-10 border-y border-[#D7C4A3] bg-[#F7EBD5]/95 py-3 backdrop-blur-md sm:-mx-6">
+        <nav aria-label="Menu categories" className="sticky top-[62px] sm:top-16 z-30 -mx-4 mb-10 border-y border-[#D7C4A3] bg-[#F7EBD5]/95 py-3 backdrop-blur-md sm:-mx-6">
           <div className="no-scrollbar flex items-center gap-2 overflow-x-auto px-4 sm:px-6">
             <button
               onClick={() => setSelectedCategory("all")}
@@ -1145,36 +1223,41 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
                           </span>
                         ) : qtyInCart === 0 ? (
                           <button
+                            type="button"
                             onClick={(e) => {
                               e.stopPropagation();
                               updateCart(item, 1);
                             }}
-                            className="px-4 py-1.5 rounded-full bg-[#140E0A] hover:bg-[#9E3E26] text-[#FAF8F5] text-xs font-sans font-bold uppercase tracking-wider shadow-2xs transition-all cursor-pointer"
+                            className="px-4 py-1.5 rounded-full bg-[#140E0A] hover:bg-[#9E3E26] text-[#FAF8F5] text-xs font-sans font-bold uppercase tracking-wider shadow-2xs transition-all cursor-pointer touch-manipulation select-none active:scale-95 min-h-[34px]"
                           >
                             ADD
                           </button>
                         ) : (
-                          <div className="flex items-center gap-1.5 bg-[#140E0A] text-[#FAF8F5] rounded-full px-2.5 py-1 shadow-xs">
+                          <div className="flex items-center gap-1.5 bg-[#140E0A] text-[#FAF8F5] rounded-full px-2 py-1 shadow-xs">
                             <button
+                              type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 updateCart(item, -1);
                               }}
-                              className="w-5 h-5 rounded-full hover:bg-[#9E3E26] flex items-center justify-center transition cursor-pointer"
+                              className="w-7 h-7 rounded-full hover:bg-[#9E3E26] active:bg-[#9E3E26] flex items-center justify-center transition cursor-pointer touch-manipulation select-none active:scale-90"
+                              aria-label="Decrease quantity"
                             >
-                              <Minus className="w-3 h-3" />
+                              <Minus className="w-3.5 h-3.5" />
                             </button>
-                            <span className="font-mono font-bold text-xs px-1">
+                            <span className="font-mono font-bold text-xs px-1 min-w-[18px] text-center">
                               {qtyInCart}
                             </span>
                             <button
+                              type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 updateCart(item, 1);
                               }}
-                              className="w-5 h-5 rounded-full hover:bg-[#9E3E26] flex items-center justify-center transition cursor-pointer"
+                              className="w-7 h-7 rounded-full hover:bg-[#9E3E26] active:bg-[#9E3E26] flex items-center justify-center transition cursor-pointer touch-manipulation select-none active:scale-90"
+                              aria-label="Increase quantity"
                             >
-                              <Plus className="w-3 h-3" />
+                              <Plus className="w-3.5 h-3.5" />
                             </button>
                           </div>
                         )}
@@ -1193,8 +1276,9 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
       {totalCartCount > 0 && (
         <div className="fixed bottom-5 left-4 right-4 z-40 max-w-lg mx-auto">
           <button
+            type="button"
             onClick={() => setShowCartDrawer(true)}
-            className="w-full py-3.5 px-5 rounded-2xl bg-[#261C18] hover:bg-[#B85B43] text-[#FBF9F5] font-bold text-sm uppercase tracking-wider shadow-xl flex items-center justify-between transition-all transform active:scale-[0.99]"
+            className="w-full py-3.5 px-5 rounded-2xl bg-[#261C18] hover:bg-[#B85B43] text-[#FBF9F5] font-bold text-sm uppercase tracking-wider shadow-xl flex items-center justify-between transition-all transform active:scale-[0.99] touch-manipulation select-none cursor-pointer"
           >
             <div className="flex items-center gap-2.5">
               <span className="w-7 h-7 rounded-full bg-[#FBF9F5] text-[#261C18] flex items-center justify-center font-mono font-black text-xs">

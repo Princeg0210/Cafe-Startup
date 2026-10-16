@@ -34,6 +34,8 @@ import {
   ChevronLeft,
   ChevronRight,
   CreditCard,
+  Smartphone,
+  Banknote,
   Eye,
   EyeOff,
   Layers,
@@ -43,6 +45,9 @@ import {
 import { RESTAURANT_FLOORS, RESTAURANT_TABLES, getTableFloor, getFloorName } from "@/data/floors";
 import { formatBookingId } from "@/lib/bookingId";
 import { posSession } from "@/lib/authFetch";
+import { toast } from "@/components/ui/toast";
+import { billEscPos, kotTicketEscPos } from "@/lib/escpos";
+import TakeOrderModal from "@/components/pos/TakeOrderModal";
 
 const {
   fetch: posFetch,
@@ -179,6 +184,7 @@ function SettleDiscountControl({
 }
 
 interface SessionItem {
+  menu_item_id?: number | null; // sent back by Edit Bill so same-named dishes are never mixed up
   name: string;
   quantity: number;
   unit_price: number;
@@ -355,6 +361,35 @@ const escapeHtml = (v: unknown) =>
 // Server timestamps are naive UTC; mark them as UTC so the local time is right
 const parseServerTime = (iso: string) => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(iso) ? iso : `${iso}Z`);
 
+// Direct printing to a thermal printer with no computer driver (Bluetooth / USB serial),
+// via the browser's Web Serial support (Chrome and Edge on Windows / Mac).
+type SerialPrinterPort = {
+  open(options: { baudRate: number }): Promise<void>;
+  close(): Promise<void>;
+  writable: WritableStream<Uint8Array> | null;
+};
+type WebSerial = {
+  requestPort(): Promise<SerialPrinterPort>;
+  getPorts(): Promise<SerialPrinterPort[]>;
+};
+const getWebSerial = (): WebSerial | null =>
+  typeof navigator !== "undefined" && "serial" in navigator ? (navigator as unknown as { serial: WebSerial }).serial : null;
+
+function kotTicketForPrinter(t: KotTicket, paperMm: 58 | 80): Uint8Array {
+  const floor = getTableFloor(t.table_id);
+  return kotTicketEscPos(
+    {
+      kotNumber: t.kot_number,
+      tableLine: `${floor.name} - TABLE ${floor.floor_table_num}`,
+      time: parseServerTime(t.created_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true }),
+      orderNumber: t.order_number,
+      allergyInfo: t.allergy_info,
+      items: t.items,
+    },
+    paperMm
+  );
+}
+
 function kotTicketHtml(t: KotTicket, paperMm: number): string {
   const floor = getTableFloor(t.table_id);
   const time = parseServerTime(t.created_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
@@ -443,11 +478,15 @@ function printHtml(html: string, target?: Window | null): Promise<void> {
   });
 }
 
+// Gap between KOTs printed one after another (e.g. the pizza KOT, then the other KOT)
+const KOT_PRINT_GAP_MS = 14_000;
+
 export default function POSDashboard() {
   const [activeTab, setActiveTab] = useState<"tables" | "kots" | "reservations">("tables");
 
   // Table Sessions State
   const [tableOverviews, setTableOverviews] = useState<TableOverview[]>([]);
+  const [takeOrder, setTakeOrder] = useState<{ tableId: number | null } | null>(null);
   const [expandedSessions, setExpandedSessions] = useState<Record<number, boolean>>({});
   const [showClosedToday, setShowClosedToday] = useState<Record<number, boolean>>({});
   const [tableFilter, setTableFilter] = useState<"all" | "active" | "available">("all");
@@ -484,7 +523,7 @@ export default function POSDashboard() {
     }
   };
   const [autoPrintKots, setAutoPrintKots] = useState(() => readSetting("jaadoo_kot_autoprint") === "on");
-  const [kotPaperMm, setKotPaperMm] = useState<80 | 58>(() => (readSetting("jaadoo_kot_paper") === "58" ? 58 : 80));
+  const [kotPaperMm, setKotPaperMm] = useState<80 | 58>(() => (readSetting("jaadoo_kot_paper") === "80" ? 80 : 58)); // 58mm: the café's printer
   const autoPrintRef = useRef(false);
   const printQueueRef = useRef<Promise<void>>(Promise.resolve());
   const printingIdsRef = useRef<Set<number>>(new Set());
@@ -493,6 +532,72 @@ export default function POSDashboard() {
   useEffect(() => {
     autoPrintRef.current = autoPrintKots;
   }, [autoPrintKots]);
+
+  // Thermal printer connected straight to this device (no driver needed)
+  const serialPortRef = useRef<SerialPrinterPort | null>(null);
+  const [serialPrinter, setSerialPrinter] = useState<"unsupported" | "off" | "connecting" | "on">(() =>
+    !getWebSerial() ? "unsupported" : readSetting("jaadoo_kot_serial") === "on" ? "connecting" : "off"
+  );
+
+  const openSerialPrinter = async (port: SerialPrinterPort) => {
+    try {
+      await port.open({ baudRate: 9600 }); // Bluetooth serial ignores the speed; 9600 suits USB models
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === "InvalidStateError")) throw e; // already open is fine
+    }
+    serialPortRef.current = port;
+    setSerialPrinter("on");
+  };
+
+  // Reconnect the printer chosen earlier, without asking again
+  useEffect(() => {
+    const serial = getWebSerial();
+    if (!serial || readSetting("jaadoo_kot_serial") !== "on") return;
+    serial
+      .getPorts()
+      .then((ports) => (ports[0] ? openSerialPrinter(ports[0]) : setSerialPrinter("off")))
+      .catch(() => setSerialPrinter("off")); // printer switched off / out of range: stay on normal printing
+  }, []);
+
+  const connectSerialPrinter = async () => {
+    const serial = getWebSerial();
+    if (!serial) return;
+    try {
+      const port = await serial.requestPort();
+      setSerialPrinter("connecting");
+      await openSerialPrinter(port);
+      try { localStorage.setItem("jaadoo_kot_serial", "on"); } catch {}
+      toast.success("Printer connected. KOTs will print straight to it.");
+    } catch (e) {
+      setSerialPrinter("off");
+      if (!(e instanceof DOMException && e.name === "NotFoundError")) {
+        toast.error("Could not connect to the printer. Make sure it is switched on, paired, and not connected to a phone.");
+      }
+    }
+  };
+
+  const disconnectSerialPrinter = async () => {
+    const port = serialPortRef.current;
+    serialPortRef.current = null;
+    setSerialPrinter("off");
+    try { localStorage.setItem("jaadoo_kot_serial", "off"); } catch {}
+    try { await port?.close(); } catch {}
+  };
+
+  const writeToSerialPrinter = async (bytes: Uint8Array) => {
+    const port = serialPortRef.current;
+    if (!port?.writable) throw new Error("printer not connected");
+    const writer = port.writable.getWriter();
+    try {
+      await writer.write(bytes);
+    } catch (e) {
+      serialPortRef.current = null; // connection dropped: fall back to normal printing until reconnected
+      setSerialPrinter("off");
+      throw e;
+    } finally {
+      writer.releaseLock();
+    }
+  };
   const [lastNotification, setLastNotification] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<string>("");
 
@@ -545,6 +650,11 @@ export default function POSDashboard() {
   const [billSettleSession, setBillSettleSession] = useState<TableSession | null>(null);
   const [billSettleTableInfo, setBillSettleTableInfo] = useState<{ tableNumber: string; floorName: string; tableId: number } | null>(null);
   const [settlePaymentMode, setSettlePaymentMode] = useState<"CASH" | "UPI" | "CARD">("CASH");
+  const [printBillPaymentModal, setPrintBillPaymentModal] = useState<{
+    session: TableSession;
+    tableNumber: string;
+    floorName: string;
+  } | null>(null);
 
   // Reservations State
   const [reservations, setReservations] = useState<Reservation[]>([]);
@@ -611,10 +721,10 @@ export default function POSDashboard() {
         await Promise.all([fetchReservations(), fetchData()]);
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Cannot allot table: ${err.detail || "Server error"}`);
+        toast.error(`Cannot allot table: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error during verification and table allotment.");
+      toast.error("Network error during verification and table allotment.");
     } finally {
       setIsVerifyingAndAllotting(false);
     }
@@ -971,11 +1081,11 @@ export default function POSDashboard() {
       } else {
         const err = await res.json().catch(() => ({}));
         setReservations(previousReservations);
-        alert(`Cannot update reservation: ${err.detail || "Server error"}`);
+        toast.error(`Cannot update reservation: ${err.detail || "Server error"}`);
       }
     } catch {
       setReservations(previousReservations);
-      alert("Network error updating reservation status.");
+      toast.error("Network error updating reservation status.");
     } finally {
       setUpdatingResId(null);
     }
@@ -1004,18 +1114,18 @@ export default function POSDashboard() {
           body: JSON.stringify({ upi_utr: utr }),
         });
         if (res.ok) {
-          alert(`Payment for Reservation #${resId} verified and confirmed!`);
+          toast.success(`Payment for Reservation #${resId} verified and confirmed!`);
           await Promise.all([fetchReservations(), fetchPendingReviews(), fetchData()]);
         } else {
           const err = await res.json().catch(() => ({}));
-          alert(`Cannot verify payment: ${err.detail || "Server error"}`);
+          toast.error(`Cannot verify payment: ${err.detail || "Server error"}`);
         }
       } else {
         if (!confirm(`Reject bank credit UTR: ${utr}? Staff review will flag this as reviewed.`)) return;
         setPendingReviews((prev) => prev.filter((p) => p.credit_id !== creditId));
       }
     } catch {
-      alert("Network error processing review action.");
+      toast.error("Network error processing review action.");
     }
   };
 
@@ -1043,10 +1153,10 @@ export default function POSDashboard() {
         await Promise.all([fetchReservations(), fetchData()]);
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Cannot assign table: ${err.detail || "Server error"}`);
+        toast.error(`Cannot assign table: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error assigning table.");
+      toast.error("Network error assigning table.");
     }
   };
 
@@ -1140,11 +1250,12 @@ export default function POSDashboard() {
     };
   }, [posToken, soundEnabled]);
 
-  // Claim the KOT (so only one device prints it), print it here, then report the result
-  const printKotOnThisDevice = async (kotId: number, force = false, manualWindow: Window | null = null) => {
+  // Claim the KOT (so only one device prints it), print it here, then report the result.
+  // Resolves true when this device printed it.
+  const printKotOnThisDevice = async (kotId: number, force = false, manualWindow: Window | null = null): Promise<boolean> => {
     if (!posToken || printingIdsRef.current.has(kotId)) {
       manualWindow?.close();
-      return;
+      return false;
     }
     printingIdsRef.current.add(kotId);
     const apiBase = getApiBase();
@@ -1155,12 +1266,17 @@ export default function POSDashboard() {
       });
       if (!claim.ok) {
         manualWindow?.close();
-        return; // 409: another device already printed / is printing it
+        return false; // 409: another device already printed / is printing it
       }
       const ticket: KotTicket = await claim.json();
       let success = true;
       try {
-        await printHtml(kotTicketHtml(ticket, kotPaperMm), manualWindow);
+        if (serialPortRef.current) {
+          manualWindow?.close();
+          await writeToSerialPrinter(kotTicketForPrinter(ticket, kotPaperMm));
+        } else {
+          await printHtml(kotTicketHtml(ticket, kotPaperMm), manualWindow);
+        }
       } catch {
         success = false;
       }
@@ -1169,17 +1285,23 @@ export default function POSDashboard() {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${posToken}` },
         body: JSON.stringify({ success }),
       });
+      return success;
     } catch (err) {
       manualWindow?.close();
       console.error("KOT print failed:", err);
+      return false;
     } finally {
       printingIdsRef.current.delete(kotId);
     }
   };
 
-  // Print one KOT at a time, in arrival order
+  // Print one KOT at a time, in arrival order, with a 14-second gap after each printed KOT
   const enqueueKotPrint = (kotId: number, force = false) => {
-    printQueueRef.current = printQueueRef.current.then(() => printKotOnThisDevice(kotId, force)).catch(() => {});
+    printQueueRef.current = printQueueRef.current
+      .then(async () => {
+        if (await printKotOnThisDevice(kotId, force)) await new Promise((r) => setTimeout(r, KOT_PRINT_GAP_MS));
+      })
+      .catch(() => {});
   };
   useEffect(() => {
     enqueueKotPrintRef.current = enqueueKotPrint;
@@ -1200,7 +1322,7 @@ export default function POSDashboard() {
   // then show the ticket with the normal print dialog. Falls back to the hidden frame if blocked.
   const handleRetryPrint = async (kotId: number) => {
     if (!posToken) return;
-    const manualWindow = window.open("", "_blank", "width=420,height=640");
+    const manualWindow = serialPortRef.current ? null : window.open("", "_blank", "width=420,height=640");
     manualWindow?.document.write("<p style=\"font-family:sans-serif;padding:16px\">Preparing KOT…</p>");
     setRetryingIds((prev) => ({ ...prev, [kotId]: true }));
     try {
@@ -1211,13 +1333,12 @@ export default function POSDashboard() {
     }
   };
 
-  const handlePrintThermalBill = (session: TableSession, tableNumber: string, floorName: string) => {
-    const printWindow = window.open("", "_blank", "width=380,height=600");
-    if (!printWindow) {
-      alert("Please allow popups in your browser to print thermal customer bills.");
-      return;
-    }
-
+  const handlePrintThermalBill = (
+    session: TableSession,
+    tableNumber: string,
+    floorName: string,
+    paymentMode: string = "UPI"
+  ) => {
     const receiptDate = new Date().toLocaleDateString("en-IN", {
       day: "2-digit",
       month: "short",
@@ -1235,6 +1356,54 @@ export default function POSDashboard() {
     const gross = Number(session.gross_amount || (subtotal - discount + tax));
     const depositCredit = Number(session.reservation_credit || session.reservation_deposit_paid || 0);
     const netDue = Number(session.net_amount_due ?? Math.max(0, gross - depositCredit));
+    const guestId = session.reservation_id
+      ? `RES-${String(session.reservation_id).padStart(4, "0")}`
+      : `GUEST-${session.session_seq || session.session_id}`;
+
+    // Printer connected directly (Connect printer): send the bill straight to it
+    if (serialPortRef.current) {
+      const bytes = billEscPos(
+        {
+          header: ["JAADOO Pizza Project", "32 Sitaphal ki gali, Udaipur", "GSTIN: 08AAACJ1234F1Z5"],
+          info: [
+            [`Table: ${tableNumber}`, floorName],
+            [`Paid by: ${paymentMode}`, receiptDate],
+            [`Time: ${receiptTime}`, `Staff: ${staffUser?.username || "Cashier"}`],
+            [`Guest: ${guestId}`, ""],
+          ],
+          allergyInfo: session.allergy_info,
+          items: (session.items || []).map((it) => ({
+            name: it.name,
+            quantity: Number(it.quantity),
+            rate: Number(it.unit_price),
+            amount: Number(it.subtotal),
+            note: it.special_instructions,
+          })),
+          totals: [
+            { label: "Subtotal", value: subtotal },
+            ...(discount > 0
+              ? [{ label: `Discount${session.discount_type === "PERCENT" ? ` (${Number(session.discount_value)}%)` : ""}`, value: -discount }]
+              : []),
+            { label: "GST (5%)", value: tax },
+            { label: "Gross Total", value: gross, bold: true },
+            ...(depositCredit > 0 ? [{ label: "Advance deposit", value: -depositCredit }] : []),
+          ],
+          netDue,
+          footer: ["*** CUSTOMER INVOICE ***", "Thank you for dining with us!", "Please visit Jaadoo Pizza Project again."],
+        },
+        kotPaperMm
+      );
+      writeToSerialPrinter(bytes)
+        .then(() => toast.success(`Bill printed for ${tableNumber}`))
+        .catch(() => toast.error("Bill did not print. Check the printer is on, then press Connect printer again."));
+      return;
+    }
+
+    const printWindow = window.open("", "_blank", "width=380,height=600");
+    if (!printWindow) {
+      toast.warning("Please allow popups in your browser to print thermal customer bills.");
+      return;
+    }
 
     const itemsHtml = (session.items || [])
       .map(
@@ -1254,17 +1423,19 @@ export default function POSDashboard() {
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Bill Receipt - Session #${session.session_seq}</title>
+        <title>Bill Receipt - ${tableNumber} (${paymentMode})</title>
         <style>
-          @page { size: 80mm auto; margin: 0; }
+          /* Sized to the paper chosen in POS; centred on the printable area (48mm on 58mm paper, 72mm on 80mm) */
+          @page { size: ${kotPaperMm}mm auto; margin: 0; }
+          * { box-sizing: border-box; }
           body {
             font-family: 'Courier New', Courier, monospace;
-            width: 76mm;
+            width: ${kotPaperMm >= 80 ? 72 : 48}mm;
             margin: 0 auto;
-            padding: 12px 6px;
+            padding: 8px 0;
             color: #000;
             background: #fff;
-            font-size: 12px;
+            font-size: ${kotPaperMm >= 80 ? 12 : 10}px;
             line-height: 1.3;
           }
           .text-center { text-align: center; }
@@ -1295,7 +1466,7 @@ export default function POSDashboard() {
           <span>Floor: ${floorName}</span>
         </div>
         <div class="row">
-          <span>Session: #${session.session_seq}</span>
+          <span>Payment Mode: <strong>${paymentMode}</strong></span>
           <span>Date: ${receiptDate}</span>
         </div>
         <div class="row">
@@ -1387,11 +1558,11 @@ export default function POSDashboard() {
 
   const handleSeatWalkIn = async () => {
     if (!walkInTableId) {
-      alert("Please select an available table.");
+      toast.warning("Please select an available table.");
       return;
     }
     if (!posToken) {
-      alert("Staff session expired. Please sign in again.");
+      toast.error("Staff session expired. Please sign in again.");
       return;
     }
     setIsSeatingWalkIn(true);
@@ -1416,10 +1587,10 @@ export default function POSDashboard() {
         await fetchData();
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Failed to seat walk-in: ${err.detail || "Server error"}`);
+        toast.error(`Failed to seat walk-in: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error: Could not reach backend server.");
+      toast.error("Network error: Could not reach backend server.");
     } finally {
       setIsSeatingWalkIn(false);
     }
@@ -1427,15 +1598,15 @@ export default function POSDashboard() {
 
   const handleMergeTables = async () => {
     if (!mergeSourceTableId || !mergeTargetTableId) {
-      alert("Please select both source and destination tables to merge.");
+      toast.warning("Please select both source and destination tables to merge.");
       return;
     }
     if (mergeSourceTableId === mergeTargetTableId) {
-      alert("Source and destination tables must be different.");
+      toast.warning("Source and destination tables must be different.");
       return;
     }
     if (!posToken) {
-      alert("Staff session expired. Please sign in again.");
+      toast.error("Staff session expired. Please sign in again.");
       return;
     }
     setIsMerging(true);
@@ -1454,17 +1625,17 @@ export default function POSDashboard() {
       });
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
-        alert(data.message || "Tables merged successfully.");
+        toast.success(data.message || "Tables merged successfully.");
         setIsMergeModalOpen(false);
         setMergeSourceTableId(null);
         setMergeTargetTableId(null);
         await fetchData();
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Failed to merge tables: ${err.detail || "Server error"}`);
+        toast.error(`Failed to merge tables: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error: Could not reach backend server.");
+      toast.error("Network error: Could not reach backend server.");
     } finally {
       setIsMerging(false);
     }
@@ -1473,7 +1644,7 @@ export default function POSDashboard() {
   const handleSaveBillEdit = async () => {
     if (!billEditSession) return;
     if (!posToken) {
-      alert("Staff session expired.");
+      toast.error("Staff session expired.");
       return;
     }
     setIsSavingBillEdit(true);
@@ -1494,10 +1665,10 @@ export default function POSDashboard() {
         await fetchData();
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Failed to update bill items: ${err.detail || "Server error"}`);
+        toast.error(`Failed to update bill items: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error: Could not reach backend server.");
+      toast.error("Network error: Could not reach backend server.");
     } finally {
       setIsSavingBillEdit(false);
     }
@@ -1506,7 +1677,7 @@ export default function POSDashboard() {
   const handleSettleBill = async () => {
     if (!billSettleSession || !billSettleTableInfo) return;
     if (!posToken) {
-      alert("Staff session expired.");
+      toast.error("Staff session expired.");
       return;
     }
     const sessionId = billSettleSession.session_id;
@@ -1540,10 +1711,10 @@ export default function POSDashboard() {
         await Promise.all([fetchData(), fetchReservations()]);
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Cannot settle table: ${err.detail || "Server error"}`);
+        toast.error(`Cannot settle table: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error: Could not reach café backend server.");
+      toast.error("Network error: Could not reach café backend server.");
     } finally {
       setClosingSessionIds((prev) => ({ ...prev, [sessionId]: false }));
     }
@@ -1551,7 +1722,7 @@ export default function POSDashboard() {
 
   const handleCloseSession = async (sessionId: number, tableNumber: string, tableId?: number) => {
     if (!posToken) {
-      alert("Staff session expired. Please sign in again.");
+      toast.error("Staff session expired. Please sign in again.");
       return;
     }
     const session = tableOverviews.flatMap((t) => t.sessions).find((s) => s.session_id === sessionId);
@@ -1589,10 +1760,10 @@ export default function POSDashboard() {
         await Promise.all([fetchData(), fetchReservations()]);
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Cannot settle table: ${err.detail || "Server error"}`);
+        toast.error(`Cannot settle table: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error: Could not reach café backend server.");
+      toast.error("Network error: Could not reach café backend server.");
     } finally {
       setClosingSessionIds((prev) => ({ ...prev, [sessionId]: false }));
     }
@@ -1755,7 +1926,7 @@ export default function POSDashboard() {
 
   const handleResetAllSessions = async () => {
     if (!posToken) {
-      alert("Staff session expired. Please sign in again.");
+      toast.error("Staff session expired. Please sign in again.");
       return;
     }
     if (!confirm("Are you sure you want to RESET ALL POS SESSIONS?\n\nA PDF summary report will be generated and printed automatically.")) {
@@ -1780,14 +1951,14 @@ export default function POSDashboard() {
       });
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
-        alert(data.message || "All active table sessions reset. Tables are now Available.");
+        toast.success(data.message || "All active table sessions reset. Tables are now Available.");
         await Promise.all([fetchData(), fetchReservations()]);
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(`Failed to reset sessions: ${err.detail || "Server error"}`);
+        toast.error(`Failed to reset sessions: ${err.detail || "Server error"}`);
       }
     } catch {
-      alert("Network error: Could not reach café backend server.");
+      toast.error("Network error: Could not reach café backend server.");
     } finally {
       setIsResettingAll(false);
     }
@@ -1880,7 +2051,7 @@ export default function POSDashboard() {
             </div>
             <div>
               <h1 className="pt-3">
-                <BrandTitle className="font-serif font-extrabold tracking-wide text-[#5F3F6D] text-2xl" />
+                <BrandTitle className="font-poppins font-bold tracking-wide text-[#5F3F6D] text-2xl" />
               </h1>
               <p className="text-[11px] uppercase tracking-[0.25em] text-[#B85B43] font-bold mt-0.5">POS Terminal</p>
             </div>
@@ -1988,13 +2159,39 @@ export default function POSDashboard() {
     <div className="min-h-screen bg-[#F8F5F0] text-[#261C18] font-sans antialiased">
 
       {/* 1. COMPACT OPERATIONAL HEADER */}
-      <header className="sticky top-0 z-40 bg-[#FBF9F5] border-b border-[#E4DCD0] px-4 sm:px-6 py-2.5 shadow-2xs">
-        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+      <header className="sticky top-0 z-40 bg-[#FBF9F5] border-b border-[#E4DCD0] px-4 sm:px-6 py-2 shadow-2xs">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-2.5">
 
-          {/* Brand & Live Indicator */}
-          <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
+          {/* Left: Live Indicator & Shift Status */}
+          <div className="flex items-center gap-2 sm:gap-3 order-2 md:order-1 md:flex-1 justify-start min-w-0">
+            <div className="flex items-center gap-1.5 text-[11px] font-sans font-medium text-stone-700">
+              <span className={`w-2 h-2 rounded-full ${isConnected ? "bg-emerald-600" : "bg-rose-500"}`} />
+              <span className="uppercase tracking-wider font-semibold text-emerald-800">
+                LIVE SHIFT
+              </span>
+              <span className="text-stone-400 hidden sm:inline">•</span>
+              <span className="hidden font-mono text-stone-600 sm:inline">{todayStr}</span>
+            </div>
+
+            {currentTime && (
+              <span className="hidden lg:inline-flex items-center gap-1 text-[11px] font-mono text-stone-500">
+                <Clock className="w-3 h-3 text-stone-400" />
+                <span>{currentTime}</span>
+              </span>
+            )}
+
+            {lastNotification && (
+              <div className="hidden xl:flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-[#261C18] text-[#FBF9F5] text-[11px] font-medium border border-stone-700">
+                <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                <span className="truncate max-w-[180px]">{lastNotification}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Center: Brand Logo & Jaadoo Pizza Project POS */}
+          <div className="flex items-center justify-center order-1 md:order-2 shrink-0">
             <Link href="/" className="flex items-center gap-2.5 group">
-              <div className="w-16 h-10 sm:w-20 sm:h-12 rounded-xl overflow-hidden border-2 border-[#9E3E26]/40 shadow-xs bg-white shrink-0">
+              <div className="w-14 h-9 sm:w-18 sm:h-11 rounded-xl overflow-hidden border-2 border-[#9E3E26]/40 shadow-xs bg-white shrink-0">
                 <img
                   src="/jaadoo_logo.jpg"
                   alt="Jaadoo Logo"
@@ -2002,40 +2199,14 @@ export default function POSDashboard() {
                 />
               </div>
               <span className="flex items-baseline gap-1.5">
-                <BrandTitle className="font-serif font-extrabold tracking-wide text-[#5F3F6D] text-lg leading-tight" />
+                <BrandTitle className="font-poppins font-bold tracking-wide text-[#5F3F6D] text-base sm:text-lg leading-tight" />
                 <span className="font-serif italic font-normal text-sm text-[#B85B43]">POS</span>
               </span>
             </Link>
-
-            <span className="h-4 w-[1px] bg-stone-300 mx-0.5" />
-
-            <div className="flex items-center gap-1.5 text-[11px] font-sans font-medium text-stone-700">
-              <span className={`w-2 h-2 rounded-full ${isConnected ? "bg-emerald-600" : "bg-rose-500"}`} />
-              <span className="uppercase tracking-wider font-semibold text-emerald-800">
-                LIVE SHIFT
-              </span>
-              <span className="text-stone-400">•</span>
-              <span className="hidden font-mono text-stone-600 sm:inline">{todayStr}</span>
-            </div>
-
-            {currentTime && (
-              <span className="hidden md:inline-flex items-center gap-1 text-[11px] font-mono text-stone-500 ml-1">
-                <Clock className="w-3 h-3 text-stone-400" />
-                <span>{currentTime}</span>
-              </span>
-            )}
           </div>
 
-          {/* Real-time Order Popup */}
-          {lastNotification && (
-            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-md bg-[#261C18] text-[#FBF9F5] text-xs font-medium border border-stone-700">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <span className="truncate max-w-xs">{lastNotification}</span>
-            </div>
-          )}
-
-          {/* Navigation Tabs & Staff Controls */}
-          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+          {/* Right: Navigation Tabs & Staff Controls */}
+          <div className="flex items-center justify-end gap-2 order-3 md:flex-1 w-full md:w-auto flex-wrap sm:flex-nowrap">
             <div className="flex w-full items-center justify-between bg-[#ECE6DC] p-0.5 rounded-lg text-xs font-medium border border-[#E4DCD0] sm:w-auto">
               <button
                 onClick={() => setActiveTab("tables")}
@@ -2110,7 +2281,27 @@ export default function POSDashboard() {
               <Printer className="w-3.5 h-3.5" />
               <span className="hidden sm:inline font-semibold">{autoPrintKots ? "Auto-print ON" : "Auto-print OFF"}</span>
             </button>
-            {autoPrintKots && (
+            {/* Thermal printer connected directly (Chrome / Edge) */}
+            {serialPrinter !== "unsupported" && (
+              <button
+                type="button"
+                onClick={() => (serialPrinter === "on" ? disconnectSerialPrinter() : connectSerialPrinter())}
+                disabled={serialPrinter === "connecting"}
+                className={`p-1.5 rounded-md border text-xs cursor-pointer flex items-center gap-1 ${serialPrinter === "on"
+                  ? "bg-emerald-50 border-emerald-600 text-emerald-800"
+                  : "bg-white border-[#E4DCD0] text-stone-500"
+                  }`}
+                title={serialPrinter === "on"
+                  ? "KOTs print straight to the connected printer. Click to disconnect."
+                  : "Connect a Bluetooth / USB thermal printer that has no computer driver"}
+              >
+                <span className={`w-2 h-2 rounded-full ${serialPrinter === "on" ? "bg-emerald-500" : serialPrinter === "connecting" ? "bg-amber-400 animate-pulse" : "bg-stone-300"}`} />
+                <span className="hidden sm:inline font-semibold">
+                  {serialPrinter === "on" ? "Printer connected" : serialPrinter === "connecting" ? "Connecting…" : "Connect printer"}
+                </span>
+              </button>
+            )}
+            {(autoPrintKots || serialPrinter === "on") && (
               <select
                 value={kotPaperMm}
                 onChange={(e) => {
@@ -2164,6 +2355,19 @@ export default function POSDashboard() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-5 space-y-5">
 
         {/* ================= TAB 1: ACTIVE TABLES (PRIMARY OPERATIONAL SECTION) ================= */}
+        {takeOrder && posToken && (
+          <TakeOrderModal
+            tableId={takeOrder.tableId}
+            tables={tableOverviews.map((t) => {
+              const fl = getTableFloor(t.table_id, t.floor_number);
+              return { id: t.table_id, label: `Table ${t.floor_table_num || fl.floor_table_num} · ${fl.name}` };
+            })}
+            token={posToken}
+            onClose={() => setTakeOrder(null)}
+            onPlaced={() => fetchData()}
+          />
+        )}
+
         {activeTab === "tables" && (
           <>
             {/* 2. SUMMARY METRICS */}
@@ -2745,6 +2949,16 @@ export default function POSDashboard() {
                     ))}
                   </div>
 
+                  {/* Take an order for any table */}
+                  <button
+                    type="button"
+                    onClick={() => setTakeOrder({ tableId: null })}
+                    className="px-3 py-1.5 rounded-md bg-[#B85B43] hover:bg-[#9E3E26] text-white font-bold text-xs tracking-wide flex items-center gap-1 cursor-pointer"
+                  >
+                    <UtensilsCrossed className="w-3.5 h-3.5" />
+                    <span>New Order</span>
+                  </button>
+
                   {/* Filter Selector */}
                   <div className="flex items-center bg-[#F6F3EC] p-0.5 rounded-md border border-[#E4DCD0]">
                     {(["all", "active", "available"] as const).map((mode) => (
@@ -3094,9 +3308,15 @@ export default function POSDashboard() {
                                       <div className="grid grid-cols-2 gap-1.5">
                                         <button
                                           type="button"
-                                          onClick={() => handlePrintThermalBill(activeSession, `Table ${floorTableNum}`, floorInfo.name)}
-                                          className="bg-[#B85B43] hover:bg-[#9E3E26] text-white py-2 px-2 rounded-md font-bold text-[11px] sm:text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-1 shadow-2xs cursor-pointer"
-                                          title="Direct print formatted 80mm customer thermal invoice"
+                                          onClick={() =>
+                                            setPrintBillPaymentModal({
+                                              session: activeSession,
+                                              tableNumber: `Table ${floorTableNum}`,
+                                              floorName: floorInfo.name,
+                                            })
+                                          }
+                                          className="bg-[#B85B43] hover:bg-[#9E3E26] text-white py-2 px-2 rounded-md font-bold text-[11px] sm:text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-1 shadow-2xs cursor-pointer touch-manipulation select-none active:scale-[0.98] min-h-[38px]"
+                                          title="Print formatted 80mm customer thermal invoice"
                                         >
                                           <Printer className="w-3.5 h-3.5" />
                                           <span>★ Print Bill</span>
@@ -3113,12 +3333,22 @@ export default function POSDashboard() {
                                             });
                                           }}
                                           disabled={closingSessionIds[activeSession.session_id]}
-                                          className="bg-[#261C18] hover:bg-[#140E0A] text-white py-2 px-2 rounded-md font-bold text-[11px] sm:text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-1 shadow-2xs cursor-pointer disabled:opacity-50"
+                                          className="bg-[#261C18] hover:bg-[#140E0A] text-white py-2 px-2 rounded-md font-bold text-[11px] sm:text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-1 shadow-2xs cursor-pointer disabled:opacity-50 touch-manipulation select-none active:scale-[0.98] min-h-[38px]"
                                         >
                                           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                                           <span>Settle Bill</span>
                                         </button>
                                       </div>
+
+                                      {/* Add a new round: goes to the kitchen as a KOT */}
+                                      <button
+                                        type="button"
+                                        onClick={() => setTakeOrder({ tableId: tbl.table_id })}
+                                        className="w-full bg-[#B85B43] hover:bg-[#9E3E26] text-white py-1.5 rounded-md font-bold text-[11px] sm:text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-1 cursor-pointer"
+                                      >
+                                        <UtensilsCrossed className="w-3.5 h-3.5" />
+                                        <span>+ Add Order</span>
+                                      </button>
 
                                       {/* Secondary Row: Preview Bill & Edit Bill */}
                                       <div className="grid grid-cols-2 gap-1.5">
@@ -3160,7 +3390,15 @@ export default function POSDashboard() {
 
                                   {/* Available Table Quick Seat Walk-in */}
                                   {!isOccupied && !isReserved && isTodaySelected && (
-                                    <div className="pt-2 border-t border-stone-100">
+                                    <div className="pt-2 border-t border-stone-100 grid grid-cols-2 gap-1.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => setTakeOrder({ tableId: tbl.table_id })}
+                                        className="w-full bg-[#B85B43] hover:bg-[#9E3E26] text-white py-1.5 rounded-md font-semibold text-xs tracking-wider transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                                      >
+                                        <UtensilsCrossed className="w-3.5 h-3.5" />
+                                        <span>Take Order</span>
+                                      </button>
                                       <button
                                         type="button"
                                         onClick={() => {
@@ -3888,7 +4126,11 @@ export default function POSDashboard() {
                 <button
                   type="button"
                   onClick={() => {
-                    handlePrintThermalBill(billPreviewSession, billPreviewTableInfo.tableNumber, billPreviewTableInfo.floorName);
+                    setPrintBillPaymentModal({
+                      session: billPreviewSession,
+                      tableNumber: billPreviewTableInfo.tableNumber,
+                      floorName: billPreviewTableInfo.floorName,
+                    });
                   }}
                   className="flex-1 bg-[#B85B43] hover:bg-[#9E3E26] text-white py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs"
                 >
@@ -4143,6 +4385,74 @@ export default function POSDashboard() {
                   type="button"
                   onClick={() => setBillSettleSession(null)}
                   className="px-3.5 py-2.5 border border-stone-200 hover:bg-stone-100 text-stone-700 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* MODAL: SELECT PAYMENT MODE FOR BILL PRINT */}
+        {printBillPaymentModal && (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-[#FFFDF9] border border-[#E6DCCF] rounded-3xl p-6 max-w-sm w-full shadow-2xl space-y-4 font-sans text-stone-900 animate-in fade-in zoom-in-95 duration-150">
+              <div className="flex items-center justify-between border-b border-[#F0E8DC] pb-3">
+                <div>
+                  <h3 className="text-base font-bold text-[#241A14]">Select Payment Mode</h3>
+                  <p className="text-xs text-[#665448] mt-0.5 font-medium">
+                    {printBillPaymentModal.tableNumber} ({printBillPaymentModal.floorName})
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPrintBillPaymentModal(null)}
+                  className="text-[#8C7A6D] hover:text-[#241A14] p-1 rounded-lg text-lg cursor-pointer"
+                  title="Cancel"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <p className="text-xs text-[#7A6A5E] font-medium">
+                Choose payment mode to print on the customer invoice:
+              </p>
+
+              <div className="grid grid-cols-1 gap-2.5 pt-1">
+                {/* ponytail: DRY mapped payment mode selector with single-click thermal print */}
+                {(
+                  [
+                    { mode: "UPI" as const, desc: "Google Pay / PhonePe / Paytm / QR", icon: Smartphone, bg: "bg-purple-100 text-purple-700 group-hover:bg-purple-200" },
+                    { mode: "Cash" as const, desc: "Counter Cash Payment", icon: Banknote, bg: "bg-emerald-100 text-emerald-700 group-hover:bg-emerald-200" },
+                    { mode: "Card" as const, desc: "Debit / Credit Card POS Swipe", icon: CreditCard, bg: "bg-blue-100 text-blue-700 group-hover:bg-blue-200" },
+                  ] as const
+                ).map(({ mode, desc, icon: Icon, bg }) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => {
+                      const target = printBillPaymentModal;
+                      setPrintBillPaymentModal(null);
+                      handlePrintThermalBill(target.session, target.tableNumber, target.floorName, mode);
+                    }}
+                    className="flex items-center gap-3.5 p-3.5 rounded-2xl border-2 border-[#E2D5C3] hover:border-[#9E3E26] bg-white hover:bg-[#FAF4EC] transition-all cursor-pointer shadow-2xs group text-left touch-manipulation select-none active:scale-[0.98]"
+                  >
+                    <div className={`w-10 h-10 rounded-xl ${bg} flex items-center justify-center shrink-0`}>
+                      <Icon className="w-5 h-5" />
+                    </div>
+                    <div className="flex-1">
+                      <div className="font-bold text-sm text-[#241A14] group-hover:text-[#9E3E26]">{mode}</div>
+                      <div className="text-[11px] text-[#7A6A5E]">{desc}</div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              <div className="pt-2">
+                <button
+                  type="button"
+                  onClick={() => setPrintBillPaymentModal(null)}
+                  className="w-full py-2.5 rounded-xl border border-[#D8CABE] text-[#665448] font-bold text-xs hover:bg-[#F0E8DC] transition-colors cursor-pointer touch-manipulation select-none active:scale-[0.98]"
                 >
                   Cancel
                 </button>

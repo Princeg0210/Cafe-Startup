@@ -40,15 +40,15 @@ class Settings(BaseSettings):
     DEFAULT_MANAGER_PASSWORD: Optional[str] = None
 
     # JWT Authentication (All portal logins expire after 5 hours)
-    JWT_SECRET_KEY: str = "super-secret-jwt-key-jaadoo-udaipur"
+    JWT_SECRET_KEY: str = "change-this-jwt-secret-key-in-production"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 300  # 5 hours (300 minutes)
     JWT_REFRESH_TOKEN_EXPIRE_MINUTES: int = 300  # 5 hours (300 minutes)
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 1
 
     # Merchant UPI Payment Settings (Direct to bank, 0% commission)
-    MERCHANT_UPI_ID: str = "9460555743-2@ybl"
-    MERCHANT_NAME: str = "Jaadoo Cafe Piza"
+    MERCHANT_UPI_ID: str = "restrova@ybl"
+    MERCHANT_NAME: str = "Restrova Cafe"
 
     # Razorpay Payment Gateway & Testing Portal
     RAZORPAY_KEY_ID: str = "rzp_test_JaadooCafe10"
@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     SARVAM_API_KEY: Optional[str] = None
     SARVAM_BASE_URL: str = "https://api.sarvam.ai"
     SARVAM_DOCUMENT_MODEL: str = "sarvam-vision-2.1"
+
+    # Subtract recipe ingredients from inventory on every order (and refuse orders when stock is short).
+    # Off for now: stock only changes through admin adjustments and scanned supplier bills.
+    INVENTORY_AUTO_DEDUCT: bool = False
 
     # Booking rules checked on every new booking (website, holds, staff-created)
     BOOKING_RULES_ENFORCED: bool = True

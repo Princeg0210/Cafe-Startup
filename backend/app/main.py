@@ -74,12 +74,12 @@ async def api_gateway_limits(request: Request, call_next):
     response.headers["X-RateLimit-Limit"] = str(limit)
     return response
 
-# Configure CORS
+# Configure CORS (OWASP A01 & A05: Restrict credentialed origins to trusted domains)
 origins = settings.CORS_ORIGINS if isinstance(settings.CORS_ORIGINS, list) else [settings.CORS_ORIGINS]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=r"^https?://.*",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://([a-zA-Z0-9-]+\.)*(vercel\.app|onrender\.com)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -127,9 +127,10 @@ async def health_check_db():
                 return {"status": "healthy", "database": "PostgreSQL connected"}
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
+        db_err = str(e) if settings.APP_ENV == "development" else "Database service unavailable"
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "unhealthy", "database": str(e)},
+            content={"status": "unhealthy", "database": db_err},
         )
 
 
@@ -215,6 +216,10 @@ async def on_startup():
                 if "allergy_info" not in k_cols:
                     await conn.execute(text("ALTER TABLE kots ADD COLUMN allergy_info VARCHAR(500)"))
 
+                table_cols = await conn.execute(text("PRAGMA table_info(tables)"))
+                if "floor" not in [c[1] for c in table_cols.fetchall()]:
+                    await conn.execute(text("ALTER TABLE tables ADD COLUMN floor INTEGER"))
+
                 menu_cols = await conn.execute(text("PRAGMA table_info(menu_items)"))
                 if "image_url" not in [c[1] for c in menu_cols.fetchall()]:
                     await conn.execute(text("ALTER TABLE menu_items ADD COLUMN image_url VARCHAR(255)"))
@@ -265,6 +270,12 @@ async def on_startup():
                 await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS allergy_info VARCHAR(500)"))
                 await conn.execute(text("ALTER TABLE kots ADD COLUMN IF NOT EXISTS allergy_info VARCHAR(500)"))
                 await conn.execute(text("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS image_url VARCHAR(255)"))
+                await conn.execute(text("ALTER TABLE tables ADD COLUMN IF NOT EXISTS floor INTEGER"))
+                # Tidy dish names: no leading/trailing or double spaces ("MARINARA " broke name matching)
+                await conn.execute(text(
+                    r"UPDATE menu_items SET name = regexp_replace(btrim(name), '\s+', ' ', 'g') "
+                    r"WHERE name <> regexp_replace(btrim(name), '\s+', ' ', 'g')"
+                ))
 
                 await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS reservation_deposit_paid NUMERIC(12, 2) DEFAULT 0.00"))
                 await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS reservation_credit NUMERIC(12, 2) DEFAULT 0.00"))
@@ -320,6 +331,11 @@ async def on_startup():
             from app.utils.init_tables import ensure_default_tables
             await ensure_default_tables(db)
         logger.info("Default tables and QR tokens ensured.")
+
+        async with AsyncSessionLocal() as db:
+            from app.services.table_service import TableService
+            await TableService.get_generalized_qrs(db)
+        logger.info("Generalized QR code ensured.")
 
         async with AsyncSessionLocal() as db:
             from app.utils.init_inventory import ensure_raw_materials
